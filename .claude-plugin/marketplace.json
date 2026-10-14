@@ -1,0 +1,5 @@
+{
+  "name": "claude-mods",
+  "owner": { "name": "Peter Schmitt" },
+  "plugins": [{ "name": "ship-queue", "source": "./" }]
+}
