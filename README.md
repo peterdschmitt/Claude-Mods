@@ -19,3 +19,18 @@ At the Claude Code prompt:
 ```
 
 Answer `y` to add the marketplace, pick the user scope. Open Claude Code in a project folder; the pane opens on its own, or type `/ship`.
+
+## Using the buttons
+
+Terminal clicks don't reach the pane, so every button has a number:
+
+- **ctrl+x tab** focuses the pane, then press the item's number (1–9). Ship and Open PR ask first: **y** confirms, **n** cancels.
+- Or type it: `/ship 68` (a PR number), `/ship 2` (the item's number) or `/ship <branch>`. Typing it is the confirmation.
+
+## Updating
+
+```
+claude plugin marketplace update claude-mods && claude plugin update ship-queue@claude-mods
+```
+
+Then restart Claude Code.

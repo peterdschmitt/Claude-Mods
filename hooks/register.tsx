@@ -402,12 +402,49 @@ async function askClaude($: $T, item: ShipItem, fix: ShipFix): Promise<void> {
   $.ui.toast(`Asked Claude: ${fix.label} — ${item.title}`)
 }
 
+/** Items that have a button, in drawing order: their number is their hotkey and their /ship argument. */
+function actionable(list: ShipItem[]): ShipItem[] {
+  return ORDER.flatMap(r => list.filter(i => i.readiness === r)).filter(i => i.action || i.fix)
+}
+
+/** Finds an item by its number in the pane, a PR number (#68 or 68) or a branch name. */
+function findItem(list: ShipItem[], arg: string): ShipItem | undefined {
+  const a = arg.trim().replace(/^#/, '')
+  if (!a) return undefined
+  const acts = actionable(list)
+  const byPr = list.find(i => i.where === 'pr' && i.title.startsWith(`#${a} `))
+  if (byPr) return byPr
+  const byRef = list.find(i => i.ref === a)
+  if (byRef) return byRef
+  const idx = Number(a)
+  if (Number.isInteger(idx) && idx >= 1 && idx <= acts.length) return acts[idx - 1]
+  return undefined
+}
+
+/** What pressing an item's button does once confirmed (or typed as a command, which is the confirmation). */
+async function act($: $T, item: ShipItem): Promise<string> {
+  if (item.action) {
+    void ship($, item)
+    return item.action.kind === 'merge-pr' ? `Shipping ${item.title} to production…` : `Pushing ${item.title}…`
+  }
+  if (item.fix) {
+    await askClaude($, item, item.fix)
+    return `${item.fix.label}: handed ${item.title} to Claude${item.fix.autoShip ? ' — it ships automatically once green' : ''}.`
+  }
+  return `${item.title} has nothing to do yet: ${item.reason}.`
+}
+
+function needsConfirm(item: ShipItem): boolean {
+  return Boolean(item.action?.kind === 'merge-pr' || item.fix?.confirm)
+}
+
 // ── Hooks ─────────────────────────────────────────────────────────────
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'ship',
-      description: 'Open the ship queue: code written but not live yet',
+      description: 'Ship queue. /ship opens it; /ship 68 ships PR #68 or runs item 68\'s button',
+      argumentHint: '[#PR | item number | branch]',
     })
     void $.ui.open({ id: PANE, title: 'Ship queue' })
     $.clock.after(200, () => void scan($))
@@ -415,10 +452,20 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('command.run', { command: 'ship' }, async $ => {
+  on('command.run', { command: 'ship' }, async ($, e) => {
     await $.ui.open({ id: PANE, title: 'Ship queue' })
-    $.clock.after(50, () => void scan($))
-    return { text: 'Ship queue opened.' }
+    const arg = e.args.trim()
+    if (!arg) {
+      $.clock.after(50, () => void scan($))
+      return { text: 'Ship queue opened.' }
+    }
+    const list = await read($, items)
+    const item = findItem(list, arg)
+    if (!item) return { text: `Nothing in the ship queue matches "${arg}".` }
+    if (item.action?.kind === 'merge-pr' && item.readiness !== 'ready') {
+      return { text: `${item.title} is not green: ${item.reason}.` }
+    }
+    return { text: await act($, item) }
   })
 
   // Claude may have committed, pushed or opened PRs during a turn.
@@ -436,12 +483,25 @@ export const register: Register = on => {
     const inFlight = await read($, shipping)
     const handed = new Set(await read($, asked))
     const approved = await read($, autoShip)
-    const recent = (await read($, log)).filter(l => l.isError)
+    const errs = (await read($, log)).filter(l => l.isError)
     const live = await read($, shipped)
     const problems = await read($, errors)
     const now = await $.clock.now()
-    const width = Math.max(30, (e.props.bodyColumns ?? 60) - 2)
+    const width = Math.max(30, (e.props.bodyColumns ?? 60) - 1)
     const sorted = ORDER.flatMap(r => list.filter(i => i.readiness === r))
+    const acts = actionable(list)
+
+    // Fit the pane: never draw more rows than it has, so nothing overflows.
+    let room = Math.max(6, e.props.scroll?.bodyRows ?? (e.viewport?.rows ?? 24) - 6)
+    room -= 2 // header + hint
+    room -= problems.length + Math.min(errs.length, 1)
+    const extra = pending ? 1 : 0
+    const fitItems = Math.max(1, Math.floor((room - extra - 1) / 2))
+    const shown = sorted.slice(0, fitItems)
+    const hidden = sorted.length - shown.length
+    room -= shown.length * 2 + extra + (hidden > 0 ? 1 : 0)
+    const shippedRows = Math.max(0, room - 1)
+    const liveShown = shippedRows >= 2 ? live.slice(0, shippedRows) : []
 
     return (
       <Box flexDirection="column" width={width}>
@@ -451,103 +511,101 @@ export const register: Register = on => {
               ●{list.filter(i => i.readiness === r).length}
             </Text>
           ))}
-          <Text dimColor>
-            {' '}
-            {busy ? 'checking…' : when ? ago(now, when) : 'not checked'}
-          </Text>
+          <Text dimColor>{busy ? 'checking…' : when ? ago(now, when) : 'not checked'}</Text>
           <Button key="refresh" label="↻" plain onPress={() => void scan($)} />
         </Box>
+        <Text dimColor wrap="truncate-end">
+          {acts.length > 0 ? `ctrl+x tab then 1–${Math.min(9, acts.length)} · or type /ship <#PR or number>` : ' '}
+        </Text>
 
         {problems.map(p => (
           <Text color="error" wrap="truncate-end">
             ! {p}
           </Text>
         ))}
+        {errs.slice(0, 1).map(l => (
+          <Text color="error" wrap="truncate-end">
+            {ago(now, l.at)} · {l.text}
+          </Text>
+        ))}
         {list.length === 0 && when > 0 && problems.length === 0 && (
           <Text color="success">Everything written is live.</Text>
         )}
 
-        {sorted.map(item => {
+        {shown.map(item => {
           const r = item.readiness
-          const isConfirming = item.action && pending === item.id && inFlight !== item.id
+          const n = acts.indexOf(item) + 1
+          const key = n >= 1 && n <= 9 ? String(n) : undefined
+          const isPending = pending === item.id || pending === `fix:${item.id}`
+          const label = item.action
+            ? item.action.kind === 'merge-pr'
+              ? 'Ship'
+              : 'Push'
+            : item.fix
+              ? handed.has(item.id)
+                ? `${item.fix.label} ✓`
+                : item.fix.label
+              : ''
+          const press = () =>
+            needsConfirm(item)
+              ? update($, confirming, () => (item.action ? item.id : `fix:${item.id}`))
+              : act($, item)
           return (
-            <Box key={`row:${item.id}`} flexDirection="column" marginTop={1}>
+            <Box key={`row:${item.id}`} flexDirection="column">
               <Box flexDirection="row" gap={1}>
                 <Box flexGrow={1} flexShrink={1}>
                   <Text color={COLOR[r]} bold={r === 'ready'} wrap="truncate-end">
-                    ● {item.title}
+                    {n > 0 ? `${n} ` : '  '}● {item.title}
                   </Text>
                 </Box>
                 {approved.some(a => a.repo === item.repo && a.ref === item.ref) && (
                   <Text color="success">auto-ship</Text>
                 )}
                 {inFlight === item.id && <Text color="warning">shipping…</Text>}
-                {item.action && inFlight !== item.id && !isConfirming && (
+                {label !== '' && inFlight !== item.id && !isPending && (
                   <Button
-                    key={`ship:${item.id}`}
-                    label={item.action.kind === 'merge-pr' ? 'Ship' : 'Push'}
-                    variant="primary"
-                    onPress={() => update($, confirming, () => item.id)}
-                  />
-                )}
-                {item.fix && !item.action && pending !== `fix:${item.id}` && (
-                  <Button
-                    key={`fix:${item.id}`}
-                    label={handed.has(item.id) ? `${item.fix.label} (asked)` : item.fix.label}
-                    onPress={() =>
-                      item.fix!.confirm ? update($, confirming, () => `fix:${item.id}`) : askClaude($, item, item.fix!)
-                    }
+                    key={`go:${item.id}`}
+                    label={label}
+                    hotkey={key}
+                    variant={item.action ? 'primary' : undefined}
+                    onPress={press}
                   />
                 )}
               </Box>
               <Text dimColor wrap="truncate-end">
-                {'  '}
+                {'    '}
                 {item.reason}
                 {item.detail ? ` · ${item.detail}` : ''}
               </Text>
-              {item.fix?.confirm && pending === `fix:${item.id}` && (
-                <Box flexDirection="row" gap={1} paddingLeft={2} flexWrap="wrap">
-                  <Text color="warning">{item.fix.confirm}</Text>
-                  <Button
-                    key={`fixconfirm:${item.id}`}
-                    label="Confirm"
-                    variant="primary"
-                    onPress={() => void askClaude($, item, item.fix!)}
-                  />
-                  <Button key={`fixcancel:${item.id}`} label="Cancel" onPress={() => update($, confirming, () => '')} />
-                </Box>
-              )}
-              {isConfirming && (
-                <Box flexDirection="row" gap={1} paddingLeft={2}>
-                  <Text color="warning">
-                    {item.action!.kind === 'merge-pr' ? 'Merge to main → production?' : 'Push branch to GitHub?'}
+              {isPending && (
+                <Box flexDirection="row" gap={1} paddingLeft={4}>
+                  <Text color="warning" wrap="truncate-end">
+                    {item.action ? 'Merge to main → production?' : (item.fix?.confirm ?? 'Go?')}
                   </Text>
                   <Button
-                    key={`confirm:${item.id}`}
+                    key={`yes:${item.id}`}
                     label="Confirm"
+                    hotkey="y"
                     variant="primary"
-                    onPress={() => void ship($, item)}
+                    onPress={() => {
+                      void update($, confirming, () => '')
+                      void act($, item)
+                    }}
                   />
-                  <Button key={`cancel:${item.id}`} label="Cancel" onPress={() => update($, confirming, () => '')} />
+                  <Button key={`no:${item.id}`} label="Cancel" hotkey="n" onPress={() => update($, confirming, () => '')} />
                 </Box>
               )}
             </Box>
           )
         })}
+        {hidden > 0 && <Text dimColor>  +{hidden} more — make the pane taller to see them</Text>}
 
-        {recent.slice(0, 2).map(l => (
-          <Text color="error" wrap="truncate-end">
-            {ago(now, l.at)} · {l.text}
-          </Text>
-        ))}
-
-        {live.length > 0 && (
-          <Box flexDirection="column" marginTop={1}>
+        {liveShown.length > 0 && (
+          <Box flexDirection="column">
             <Text bold>Shipped</Text>
-            {live.map(p => (
-              <Text wrap="truncate-end">
-                <Text color="success">✓</Text>
-                <Text dimColor> {day(p.mergedAt)} </Text>#{p.number} {p.title}
+            {liveShown.map(p => (
+              <Text color="success" wrap="truncate-end">
+                ✓ {day(p.mergedAt)} #{p.number} {p.title}
               </Text>
             ))}
           </Box>
