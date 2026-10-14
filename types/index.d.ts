@@ -21,6 +21,8 @@ export type ShipItem = {
   action?: ShipAction
   /** The branch behind it, for matching a new PR to an auto-ship request. */
   ref?: string
+  /** The Claude chat that wrote this code, from a Claude-Session line in its commits or PR. */
+  chat?: string
   /** A button that hands the item to Claude to move it forward. */
   fix?: ShipFix
 }
@@ -38,7 +40,7 @@ export type ShipFix = {
 export type AutoShip = { repo: string; ref: string; at: number }
 
 /** A PR merged into the default branch: live. */
-export type Shipped = { repo: string; number: number; title: string; mergedAt: string }
+export type Shipped = { repo: string; number: number; title: string; mergedAt: string; chat?: string }
 
 export type ShipLog = { at: number; text: string; isError: boolean }
 

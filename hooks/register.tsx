@@ -73,6 +73,7 @@ function repoName(slug: string): string {
 
 // ── GitHub shapes (only the fields read) ──────────────────────────────
 type Pull = {
+  body?: string | null
   number: number
   state: string
   draft: boolean
@@ -91,7 +92,19 @@ type PullDetail = {
 }
 type CheckRuns = { check_runs: { name: string; status: string; conclusion: string | null }[] }
 type Branch = { name: string; commit: { sha: string } }
-type Compare = { ahead_by: number; commits: { commit: { committer: { date: string } } }[] }
+type Compare = { ahead_by: number; commits: { commit: { message: string; committer: { date: string } } }[] }
+type PrCommit = { commit: { message: string } }
+
+const SESSION = /https:\/\/claude\.ai\/code\/session_[A-Za-z0-9]+/g
+
+/** The newest Claude chat link among these texts, newest text last. */
+function chatLink(texts: (string | null | undefined)[]): string | undefined {
+  for (const t of [...texts].reverse()) {
+    const all = t?.match(SESSION)
+    if (all && all.length > 0) return all[all.length - 1]
+  }
+  return undefined
+}
 
 // ── Classification: the "system recommendation" ──────────────────────
 export function classifyPull(
@@ -226,9 +239,10 @@ async function scanRemote($: $T, slug: string, now: number): Promise<{ items: Sh
 
   await Promise.all(
     open.map(async pull => {
-      const [detail, checks] = await Promise.all([
+      const [detail, checks, commits] = await Promise.all([
         gh<PullDetail>($, `${R}/pulls/${pull.number}`),
         gh<CheckRuns>($, `${R}/commits/${pull.head.sha}/check-runs?per_page=100`),
+        gh<PrCommit[]>($, `${R}/pulls/${pull.number}/commits?per_page=100`).catch(() => [] as PrCommit[]),
       ])
       const { readiness, reason } = classifyPull(pull, detail, checks.check_runs)
       const passed = checks.check_runs.filter(c => OK.has(c.conclusion ?? '')).length
@@ -246,6 +260,7 @@ async function scanRemote($: $T, slug: string, now: number): Promise<{ items: Sh
             : undefined,
         fix: prFix(slug, pull, readiness, reason),
         ref: pull.head.ref,
+        chat: chatLink([pull.body, ...commits.map(c => c.commit.message)]),
       })
     }),
   )
@@ -274,18 +289,19 @@ async function scanRemote($: $T, slug: string, now: number): Promise<{ items: Sh
         reason: `${cmp.ahead_by} commit(s) pushed, no PR`,
         detail: lastDate ? `last commit ${ago(now, lastDate)}` : '',
         ref: b.name,
+        chat: chatLink(cmp.commits.map(c => c.commit.message)),
         fix: {
           label: 'Open PR',
           confirm: 'Open a PR and ship it to production as soon as all checks pass?',
           autoShip: { repo: slug, ref: b.name, at: now },
-          prompt: `In ${slug}, branch \`${b.name}\` has ${cmp.ahead_by} commit(s) not on ${def} and no pull request. I have approved it for production. Bring it up to date with ${def} (resolve any conflicts), make sure it builds and its tests pass, push, then open a ready-for-review (not draft) PR against ${def} that satisfies the repo's PR checks (FR reference, evidence). Do not merge it yourself: the Ship queue merges it automatically the moment every check is green. If the branch looks abandoned, superseded or unfinished, do not open the PR — tell me instead.`,
+          prompt: `In ${slug}, branch \`${b.name}\` has ${cmp.ahead_by} commit(s) not on ${def} and no pull request. I have approved it for production. Bring it up to date with ${def} (resolve any conflicts), make sure it builds and its tests pass, push, then open a ready-for-review (not draft) PR against ${def} that satisfies the repo's PR checks (FR reference, evidence), with a link to this chat in the description if you have one. Do not merge it yourself: the Ship queue merges it automatically the moment every check is green. If the branch looks abandoned, superseded or unfinished, do not open the PR — tell me instead.`,
         },
       })
     }),
   )
   const merged: Shipped[] = pulls
     .filter((p): p is Pull & { merged_at: string } => p.merged_at !== null && p.base?.ref === def)
-    .map(p => ({ repo: slug, number: p.number, title: p.title, mergedAt: p.merged_at }))
+    .map(p => ({ repo: slug, number: p.number, title: p.title, mergedAt: p.merged_at, chat: chatLink([p.body]) }))
   return { items: out, defaultBranch: def, shipped: merged }
 }
 
@@ -458,11 +474,12 @@ async function queueText($: $T): Promise<string> {
     const how = n > 0 && verb ? ` → ${verb}: /ship ${item.where === 'pr' ? item.title.split(' ')[0]!.slice(1) : n}` : ''
     lines.push(`${DOT[item.readiness]} ${n > 0 ? `${n}. ` : ''}${short(item.title, 64)}`)
     lines.push(`      ${item.reason}${how}`)
+    if (item.chat) lines.push(`      Chat: ${item.chat}`)
   }
   if (list.length === 0 && problems.length === 0) lines.push('✅ Everything written is live.')
   if (live.length > 0) {
     lines.push('', 'Shipped')
-    for (const p of live.slice(0, 8)) lines.push(`✓ ${day(p.mergedAt)}  #${p.number} ${short(p.title, 60)}`)
+    for (const p of live.slice(0, 8)) lines.push(`✓ ${day(p.mergedAt)}  #${p.number} ${short(p.title, 60)}${p.chat ? `  — chat: ${p.chat}` : ''}`)
   }
   return lines.join('\n')
 }
@@ -490,6 +507,16 @@ export const register: Register = on => {
       return { text: opened.isPlaced ? `Ship queue opened.\n\n${text}` : text }
     }
     const list = await read($, items)
+    const chatArg = arg.match(/^chat\s+(.+)$/i)
+    if (chatArg) {
+      const want = chatArg[1]!.trim().replace(/^#/, '')
+      const target =
+        findItem(list, want)?.chat ?? (await read($, shipped)).find(p => String(p.number) === want)?.chat
+      if (!target) return { text: `No chat link recorded for "${want}".` }
+      const opener = (await $.process.run(['uname'])).stdout.trim() === 'Darwin' ? 'open' : 'xdg-open'
+      const r = await $.process.run([opener, target]).catch(() => ({ exitCode: 1 }))
+      return { text: r.exitCode === 0 ? `Opened ${target}` : `Chat: ${target}` }
+    }
     const item = findItem(list, arg)
     if (!item) return { text: `Nothing in the ship queue matches "${arg}". Type /ship to see the list.` }
     if (item.action?.kind === 'merge-pr' && item.readiness !== 'ready') {
@@ -505,7 +532,7 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const { Box, Text, Button, Link } = $.ui.resolve(e)
     const list = await read($, items)
     const when = await read($, checkedAt)
     const busy = await read($, isScanning)
@@ -545,7 +572,7 @@ export const register: Register = on => {
           <Button key="refresh" label="↻" plain onPress={() => void scan($)} />
         </Box>
         <Text dimColor wrap="truncate-end">
-          {acts.length > 0 ? `ctrl+x tab then 1–${Math.min(9, acts.length)} · or type /ship <#PR or number>` : ' '}
+          {acts.length > 0 ? `ctrl+x tab then 1–${Math.min(9, acts.length)} · /ship <#PR|n> · 💬 /ship chat <#PR|n>` : ' '}
         </Text>
 
         {problems.map(p => (
@@ -602,11 +629,16 @@ export const register: Register = on => {
                   />
                 )}
               </Box>
-              <Text dimColor wrap="truncate-end">
-                {'    '}
-                {item.reason}
-                {item.detail ? ` · ${item.detail}` : ''}
-              </Text>
+              <Box flexDirection="row" gap={1}>
+                <Box flexGrow={1} flexShrink={1}>
+                  <Text dimColor wrap="truncate-end">
+                    {'    '}
+                    {item.reason}
+                    {item.detail ? ` · ${item.detail}` : ''}
+                  </Text>
+                </Box>
+                {item.chat && (e.surface === 'terminal' ? <Text color="suggestion">💬</Text> : <Link href={item.chat} label="chat ↗" />)}
+              </Box>
               {isPending && (
                 <Box flexDirection="row" gap={1} paddingLeft={4}>
                   <Text color="warning" wrap="truncate-end">
@@ -634,9 +666,14 @@ export const register: Register = on => {
           <Box flexDirection="column">
             <Text bold>Shipped</Text>
             {liveShown.map(p => (
-              <Text color="success" wrap="truncate-end">
-                ✓ {day(p.mergedAt)} #{p.number} {p.title}
-              </Text>
+              <Box flexDirection="row" gap={1}>
+                <Box flexGrow={1} flexShrink={1}>
+                  <Text color="success" wrap="truncate-end">
+                    ✓ {day(p.mergedAt)} #{p.number} {p.title}
+                  </Text>
+                </Box>
+                {p.chat && (e.surface === 'terminal' ? <Text color="suggestion">💬</Text> : <Link href={p.chat} label="chat ↗" />)}
+              </Box>
             ))}
           </Box>
         )}

@@ -27,6 +27,10 @@ Terminal clicks don't reach the pane, so every button has a number:
 - **ctrl+x tab** focuses the pane, then press the item's number (1–9). Ship and Open PR ask first: **y** confirms, **n** cancels.
 - Or type it: `/ship 68` (a PR number), `/ship 2` (the item's number) or `/ship <branch>`. Typing it is the confirmation.
 
+## Chat links
+
+Items whose commits or PR carry a `Claude-Session` link show 💬 (Terminal) or **chat ↗** (app). `/ship chat 4` or `/ship chat 68` opens that chat in your browser.
+
 ## Updating
 
 ```
