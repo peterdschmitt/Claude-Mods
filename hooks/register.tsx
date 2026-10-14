@@ -67,6 +67,19 @@ function short(text: string, n = 70): string {
   return text.length > n ? `${text.slice(0, n - 1)}…` : text
 }
 
+/** What a set of commits does, newest first: the newest subject, and how many more. */
+function describe(subjects: string[]): string {
+  const real = subjects.filter(t => t && !/^Merge (branch|pull request|remote)/.test(t))
+  const first = real[0] ?? subjects[0] ?? 'Unnamed change'
+  const more = real.length - 1
+  return more > 0 ? `${first} (+${more} more)` : first
+}
+
+function listFiles(paths: string[]): string {
+  const names = paths.map(p => p.replace(/\/+$/, '')).map(p => (p.split('/').pop() || p) + (/\/$/.test(p) ? '/' : ''))
+  return names.length > 3 ? `${names.slice(0, 3).join(', ')} +${names.length - 3} more` : names.join(', ')
+}
+
 function repoName(slug: string): string {
   return slug.split('/')[1] ?? slug
 }
@@ -171,7 +184,11 @@ async function findRepos($: $T): Promise<{ dir: string; slug: string }[]> {
   const found = await run($, ['find', '.', '-maxdepth', '3', '-name', '.git', '-prune'])
   for (const p of found.stdout.split('\n').filter(Boolean)) dirs.add(p.replace(/\/\.git$/, ''))
   const out: { dir: string; slug: string }[] = []
-  for (const dir of dirs) {
+  const seenTop = new Set<string>()
+  for (const raw of dirs) {
+    const dir = (await run($, ['git', 'rev-parse', '--show-toplevel'], raw)).stdout.trim() || raw
+    if (seenTop.has(dir)) continue
+    seenTop.add(dir)
     const url = (await run($, ['git', 'remote', 'get-url', 'origin'], dir)).stdout.trim()
     const m = url.match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/)
     if (m?.[1]) out.push({ dir, slug: m[1] })
@@ -189,9 +206,9 @@ async function scanLocal($: $T, dir: string, slug: string, defaultBranch: string
       id: `local-dirty:${dir}`,
       repo: slug,
       where: 'local-uncommitted',
-      title: `${dirty.length} uncommitted file(s) on ${branch}`,
+      title: `Edits to ${listFiles(dirty.map(l => l.slice(3).split(' -> ').pop()!.trim()))}`,
       readiness: 'wip',
-      reason: 'Not committed yet',
+      reason: `${dirty.length} uncommitted file(s) on ${branch}`,
       detail: dir,
       fix: {
         label: 'Commit',
@@ -200,20 +217,21 @@ async function scanLocal($: $T, dir: string, slug: string, defaultBranch: string
     })
   }
 
-  let ahead = await run($, ['git', 'rev-list', '--count', '@{u}..HEAD'], dir)
-  if (ahead.exitCode !== 0) ahead = await run($, ['git', 'rev-list', '--count', 'HEAD', '--not', '--remotes'], dir)
-  const n = Number(ahead.stdout.trim()) || 0
+  let ahead = await run($, ['git', 'log', '--format=%s', '@{u}..HEAD'], dir)
+  if (ahead.exitCode !== 0) ahead = await run($, ['git', 'log', '--format=%s', 'HEAD', '--not', '--remotes'], dir)
+  const subjects = ahead.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+  const n = subjects.length
   if (n > 0) {
     const onDefault = branch === defaultBranch
     out.push({
       id: `local-ahead:${dir}:${branch}`,
       repo: slug,
       where: 'local-unpushed',
-      title: `${n} commit(s) on ${branch} not on GitHub`,
+      title: describe(subjects),
       readiness: onDefault ? 'blocked' : 'ready',
       reason: onDefault
-        ? `Committed straight to ${defaultBranch}`
-        : 'Not pushed — push to run checks and a preview',
+        ? `${n} commit(s) straight on ${defaultBranch}, not on GitHub`
+        : `${n} commit(s) on ${branch} not pushed — push to run checks and a preview`,
       detail: dir,
       action: onDefault ? undefined : { kind: 'push-branch', dir, branch },
       fix: onDefault
@@ -284,9 +302,9 @@ async function scanRemote($: $T, slug: string, now: number): Promise<{ items: Sh
         id: `branch:${slug}:${b.name}`,
         repo: slug,
         where: 'branch-no-pr',
-        title: short(b.name),
+        title: describe(cmp.commits.map(c => c.commit.message.split('\n')[0]!.trim()).reverse()),
         readiness: 'wip',
-        reason: `${cmp.ahead_by} commit(s) pushed, no PR`,
+        reason: `${cmp.ahead_by} commit(s) on ${b.name}, no PR`,
         detail: lastDate ? `last commit ${ago(now, lastDate)}` : '',
         ref: b.name,
         chat: chatLink(cmp.commits.map(c => c.commit.message)),

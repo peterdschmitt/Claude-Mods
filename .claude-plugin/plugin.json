@@ -1,6 +1,6 @@
 {
   "name": "ship-queue",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Shows code that is written but not live, color-codes what is ready to ship, and merges it when you press Ship",
   "types": "./types/index.d.ts"
 }
