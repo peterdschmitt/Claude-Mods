@@ -438,6 +438,35 @@ function needsConfirm(item: ShipItem): boolean {
   return Boolean(item.action?.kind === 'merge-pr' || item.fix?.confirm)
 }
 
+const DOT: Record<Readiness, string> = { ready: '🟢', waiting: '🟡', blocked: '🔴', wip: '⚪' }
+
+/** The queue as plain text: what /ship answers where no pane can be drawn (the app, the phone). */
+async function queueText($: $T): Promise<string> {
+  const list = await read($, items)
+  const live = await read($, shipped)
+  const problems = await read($, errors)
+  const acts = actionable(list)
+  const count = (r: Readiness) => list.filter(i => i.readiness === r).length
+  const lines: string[] = [
+    `Ship queue — ${DOT.ready} ${count('ready')} ready · ${DOT.waiting} ${count('waiting')} waiting · ${DOT.blocked} ${count('blocked')} blocked · ${DOT.wip} ${count('wip')} in progress`,
+    '',
+  ]
+  for (const p of problems) lines.push(`⚠️ ${p}`)
+  for (const item of ORDER.flatMap(r => list.filter(i => i.readiness === r))) {
+    const n = acts.indexOf(item) + 1
+    const verb = item.action ? (item.action.kind === 'merge-pr' ? 'Ship' : 'Push') : item.fix?.label
+    const how = n > 0 && verb ? ` → ${verb}: /ship ${item.where === 'pr' ? item.title.split(' ')[0]!.slice(1) : n}` : ''
+    lines.push(`${DOT[item.readiness]} ${n > 0 ? `${n}. ` : ''}${short(item.title, 64)}`)
+    lines.push(`      ${item.reason}${how}`)
+  }
+  if (list.length === 0 && problems.length === 0) lines.push('✅ Everything written is live.')
+  if (live.length > 0) {
+    lines.push('', 'Shipped')
+    for (const p of live.slice(0, 8)) lines.push(`✓ ${day(p.mergedAt)}  #${p.number} ${short(p.title, 60)}`)
+  }
+  return lines.join('\n')
+}
+
 // ── Hooks ─────────────────────────────────────────────────────────────
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -453,15 +482,16 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'ship' }, async ($, e) => {
-    await $.ui.open({ id: PANE, title: 'Ship queue' })
+    const opened = await $.ui.open({ id: PANE, title: 'Ship queue' })
     const arg = e.args.trim()
     if (!arg) {
-      $.clock.after(50, () => void scan($))
-      return { text: 'Ship queue opened.' }
+      await scan($)
+      const text = await queueText($)
+      return { text: opened.isPlaced ? `Ship queue opened.\n\n${text}` : text }
     }
     const list = await read($, items)
     const item = findItem(list, arg)
-    if (!item) return { text: `Nothing in the ship queue matches "${arg}".` }
+    if (!item) return { text: `Nothing in the ship queue matches "${arg}". Type /ship to see the list.` }
     if (item.action?.kind === 'merge-pr' && item.readiness !== 'ready') {
       return { text: `${item.title} is not green: ${item.reason}.` }
     }
